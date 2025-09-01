@@ -86,35 +86,154 @@ __global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restr
                                  const int channels, const int batches) {
     const int global_idx     = blockIdx.x * blockDim.x + threadIdx.x;
     const int total_elements = batches * channels * out_h * out_w;
+    if (global_idx >= total_elements) return;
 
-    if (global_idx >= total_elements) {
-        return;
-    }
+    conv_params params = { in_w, in_h, out_w, out_h, kernel_w, kernel_h,
+                           stride_x, stride_y, padding_x, padding_y,
+                           dilation_x, dilation_y, channels, batches };
 
-    conv_params params = { in_w,     in_h,      out_w,     out_h,      kernel_w,   kernel_h, stride_x,
-                           stride_y, padding_x, padding_y, dilation_x, dilation_y, channels, batches };
+    int n, c, oy, ox;
+    Layout::unpack_indices(global_idx, params, n, c, oy, ox);
 
-    int batch_idx, channel_idx, out_y_idx, out_x_idx;
-    Layout::unpack_indices(global_idx, params, batch_idx, channel_idx, out_y_idx, out_x_idx);
+    T acc = 0;
 
-    T accumulator = 0;
-    kernel_bounds bounds = calculate_kernel_bounds(out_x_idx, out_y_idx, params);
+    const int in_row_start = oy * params.stride_y - params.padding_y;
+    const int in_col_start = ox * params.stride_x - params.padding_x;
+    const int in_row_end   = in_row_start + (params.kernel_h - 1) * params.dilation_y + 1;
+    const int in_col_end   = in_col_start + (params.kernel_w - 1) * params.dilation_x + 1;
 
-    for (int kern_y = bounds.y_min; kern_y < bounds.y_max; ++kern_y) {
-        int in_y_idx = calculate_input_coord(out_y_idx, kern_y, params.stride_y, params.dilation_y, params.padding_y);
+    const bool fully_inside =
+        (in_row_start >= 0) && (in_col_start >= 0) &&
+        (in_row_end   <= params.in_h) && (in_col_end   <= params.in_w);
 
-        for (int kern_x = bounds.x_min; kern_x < bounds.x_max; ++kern_x) {
-            int in_x_idx = calculate_input_coord(out_x_idx, kern_x, params.stride_x, params.dilation_x, params.padding_x);
+    unsigned warp_mask = __activemask();
+    const bool warp_all_inside = __all_sync(warp_mask, fully_inside);
 
-            const T input_val  = input[Layout::input_index(batch_idx, channel_idx, in_y_idx, in_x_idx, params)];
-            const T kernel_val = kernel[Layout::kernel_index(channel_idx, kern_y, kern_x, params)];
+    if (warp_all_inside) {
+        // ---- FAST PATH: No boundary check, fixed size/fully converged ----
+        #pragma unroll
+        for (int ky = 0; ky < params.kernel_h; ++ky) {
+            const int iy = in_row_start + ky * params.dilation_y;
+            #pragma unroll
+            for (int kx = 0; kx < params.kernel_w; ++kx) {
+                const int ix = in_col_start + kx * params.dilation_x;
+                const T ival = input[Layout::input_index(n, c, iy, ix, params)];
+                const T wval = kernel[Layout::kernel_index(c, ky, kx, params)];
+                acc += ival * wval;
+            }
+        }
+    } else {
+        // ---- SLOW PATH: Boundary check ----
+        #pragma unroll
+        for (int ky = 0; ky < params.kernel_h; ++ky) {
+            const int iy = in_row_start + ky * params.dilation_y;
+            const bool row_valid = (unsigned)iy < (unsigned)params.in_h;
 
-            accumulator += input_val * kernel_val;
+            #pragma unroll
+            for (int kx = 0; kx < params.kernel_w; ++kx) {
+                const int ix = in_col_start + kx * params.dilation_x;
+                const bool valid = row_valid && ((unsigned)ix < (unsigned)params.in_w);
+
+                T ival = 0;
+                if (valid) {
+                    ival = input[Layout::input_index(n, c, iy, ix, params)];
+                }
+                const T wval = kernel[Layout::kernel_index(c, ky, kx, params)];
+                acc += ival * wval;
+            }
         }
     }
 
-    output[Layout::output_index(batch_idx, channel_idx, out_y_idx, out_x_idx, params)] = accumulator;
+    output[Layout::output_index(n, c, oy, ox, params)] = acc;
 }
+
+
+// Tiled version for stride = 1 (better performance)
+template <typename T, typename Layout, int TILE_X, int TILE_Y>
+__global__ void conv2d_dw_kernel_tiled(
+    const T* __restrict__ input,
+    const T* __restrict__ kernel,
+    T* __restrict__ output,
+    int in_w, int in_h,
+    int out_w, int out_h,
+    int kernel_w, int kernel_h,
+    int stride_x, int stride_y,
+    int padding_x, int padding_y,
+    int dilation_x, int dilation_y,
+    int channels, int batches)
+{
+    const int cz = blockIdx.z;
+    const int c  = cz % channels;
+    const int n  = cz / channels;
+    if (n >= batches) return;
+
+    const int ox0 = blockIdx.x * TILE_X;
+    const int oy0 = blockIdx.y * TILE_Y;
+
+    const int in_x0 = ox0 * stride_x - padding_x;
+    const int in_y0 = oy0 * stride_y - padding_y;
+
+    const int tile_w = (TILE_X - 1) * stride_x + (kernel_w - 1) * dilation_x + 1;
+    const int tile_h = (TILE_Y - 1) * stride_y + (kernel_h - 1) * dilation_y + 1;
+
+    extern __shared__ T smem[]; // tile_w * tile_h + kernel_w * kernel_h
+    T* tile = smem;
+    T* kernel_tile = smem + tile_w * tile_h;
+
+    conv_params params = {
+        in_w, in_h, out_w, out_h, kernel_w, kernel_h,
+        stride_x, stride_y, padding_x, padding_y,
+        dilation_x, dilation_y, channels, batches
+    };
+
+    // Load input tile to shared memory
+    for (int dy = threadIdx.y; dy < tile_h; dy += blockDim.y) {
+        const int gy = in_y0 + dy;
+        const bool y_ok = (unsigned)gy < (unsigned)in_h;
+
+        for (int dx = threadIdx.x; dx < tile_w; dx += blockDim.x) {
+            const int gx = in_x0 + dx;
+            T v = 0;
+            if (y_ok && (unsigned)gx < (unsigned)in_w) {
+                v = input[Layout::input_index(n, c, gy, gx, params)];
+            }
+            tile[dy * tile_w + dx] = v;
+        }
+    }
+    
+    // Load kernel to shared memory
+    for (int ky = threadIdx.y; ky < kernel_h; ky += blockDim.y) {
+        for (int kx = threadIdx.x; kx < kernel_w; kx += blockDim.x) {
+            kernel_tile[ky * kernel_w + kx] = kernel[Layout::kernel_index(c, ky, kx, params)];
+        }
+    }
+    __syncthreads();
+
+    const int ox = ox0 + threadIdx.x;
+    const int oy = oy0 + threadIdx.y;
+
+    if (ox < out_w && oy < out_h) {
+        T acc = 0;
+
+        const int sx0 = threadIdx.x * stride_x;
+        const int sy0 = threadIdx.y * stride_y;
+
+        #pragma unroll
+        for (int ky = 0; ky < kernel_h; ++ky) {
+            const int sy = sy0 + ky * dilation_y;
+            #pragma unroll
+            for (int kx = 0; kx < kernel_w; ++kx) {
+                const int sx = sx0 + kx * dilation_x;
+                const T a = tile[sy * tile_w + sx];    
+                const T w = kernel_tile[ky * kernel_w + kx]; 
+                acc = fmaf(a, w, acc);
+            }
+        }
+
+        output[Layout::output_index(n, c, oy, ox, params)] = acc;
+    }
+}
+
 
 void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
@@ -144,18 +263,71 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     cudaStream_t st = ctx.stream();
 
-    const int total  = batches * channels * out_h * out_w;
-    const int blocks = (total + CUDA_CONV2D_DW_BLOCK_SIZE - 1) / CUDA_CONV2D_DW_BLOCK_SIZE;
+    // Choose kernel based on stride
+    if (stride_x == 1 && stride_y == 1) {
+        // Use tiled kernel for stride = 1 (better performance)
+        const int TILE_X = 32;
+        const int TILE_Y = 8;
+        
+        // Calculate tile dimensions
+        const int tile_w = (TILE_X - 1) * stride_x + (kernel_w - 1) * dilation_x + 1;
+        const int tile_h = (TILE_Y - 1) * stride_y + (kernel_h - 1) * dilation_y + 1;
+        const size_t shared_mem_size = (tile_w * tile_h + kernel_w * kernel_h) * sizeof(float);
+        
+        // Check if shared memory size is reasonable (fallback to regular kernel if too large)
+        // Most CUDA devices support 48KB shared memory per block, but we'll be conservative
+        const size_t max_shared_mem = 32 * 1024; // 32KB limit
+        
+        if (shared_mem_size <= max_shared_mem) {
+            // 2D block configuration for tiled kernel
+            dim3 blocks_2d((out_w + TILE_X - 1) / TILE_X, 
+                            (out_h + TILE_Y - 1) / TILE_Y, 
+                            batches * channels);
+            dim3 threads_2d(TILE_X, TILE_Y);
+            
+            if (ggml_is_contiguous(input)) {
+                conv2d_dw_kernel_tiled<float, whcn_layout, TILE_X, TILE_Y><<<blocks_2d, threads_2d, shared_mem_size, st>>>(
+                    x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
+                    dilation_x, dilation_y, channels, batches);
+            } else if (ggml_is_contiguous_channels(input)) {
+                conv2d_dw_kernel_tiled<float, cwhn_layout, TILE_X, TILE_Y><<<blocks_2d, threads_2d, shared_mem_size, st>>>(
+                    x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
+                    dilation_x, dilation_y, channels, batches);
+            } else {
+                GGML_ABORT("Unsupported memory layout for conv_2d_dw");
+            }
+        } else {
+            // Fallback to regular kernel if shared memory is too large
+            const int total  = batches * channels * out_h * out_w;
+            const int blocks = (total + CUDA_CONV2D_DW_BLOCK_SIZE - 1) / CUDA_CONV2D_DW_BLOCK_SIZE;
 
-    if (ggml_is_contiguous(input)) {
-        conv2d_dw_kernel<float, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
-            x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
-            dilation_x, dilation_y, channels, batches);
-    } else if (ggml_is_contiguous_channels(input)) {
-        conv2d_dw_kernel<float, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
-            x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
-            dilation_x, dilation_y, channels, batches);
+            if (ggml_is_contiguous(input)) {
+                conv2d_dw_kernel<float, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+                    x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
+                    dilation_x, dilation_y, channels, batches);
+            } else if (ggml_is_contiguous_channels(input)) {
+                conv2d_dw_kernel<float, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+                    x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
+                    dilation_x, dilation_y, channels, batches);
+            } else {
+                GGML_ABORT("Unsupported memory layout for conv_2d_dw");
+            }
+        }
     } else {
-        GGML_ABORT("Unsupported memory layout for conv_2d_dw");
+        // Use regular kernel for stride > 1
+        const int total  = batches * channels * out_h * out_w;
+        const int blocks = (total + CUDA_CONV2D_DW_BLOCK_SIZE - 1) / CUDA_CONV2D_DW_BLOCK_SIZE;
+
+        if (ggml_is_contiguous(input)) {
+            conv2d_dw_kernel<float, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+                x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
+                dilation_x, dilation_y, channels, batches);
+        } else if (ggml_is_contiguous_channels(input)) {
+            conv2d_dw_kernel<float, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+                x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
+                dilation_x, dilation_y, channels, batches);
+        } else {
+            GGML_ABORT("Unsupported memory layout for conv_2d_dw");
+        }
     }
 }

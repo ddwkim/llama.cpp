@@ -199,6 +199,13 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+# CUDA CONV2D-DW Benchmark - Commented out due to CMake compatibility issues
+# if (GGML_CUDA)
+#     cmake_policy(SET CMP0104 NEW)
+#     cmake_policy(SET CMP0105 NEW)
+#     llama_build(benchmark-conv2d-dw.cu)
+# endif()
+
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 
