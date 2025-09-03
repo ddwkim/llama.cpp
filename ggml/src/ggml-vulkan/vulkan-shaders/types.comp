@@ -46,6 +46,21 @@
 #endif
 #endif
 
+#if defined(DATA_A_I32)
+#define QUANT_K 1
+#define QUANT_R 1
+
+#if !defined(LOAD_VEC_A) || LOAD_VEC_A == 1
+#define A_TYPE int
+#elif LOAD_VEC_A == 2
+#define A_TYPE ivec2
+#elif LOAD_VEC_A == 4
+#define A_TYPE ivec4
+#else
+#error unsupported
+#endif
+#endif
+
 #define QUANT_K_Q4_0 32
 #define QUANT_R_Q4_0 2
 
@@ -205,6 +220,18 @@ struct block_q8_1_packed32
 {
     f16vec2 ds;
     int32_t qs[8];
+};
+
+// 4 blocks in one to allow 16-byte/128-bit alignment and loads
+struct block_q8_1_x4
+{
+    f16vec2 ds[4];
+    int32_t qs[32];
+};
+struct block_q8_1_x4_packed128
+{
+    f16vec2 ds[4];
+    ivec4 qs[8];
 };
 
 // K-quants
