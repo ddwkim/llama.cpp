@@ -4399,6 +4399,7 @@ struct test_acc : public test_case {
     }
 };
 
+
 // GGML_OP_PAD
 struct test_pad : public test_case {
     const ggml_type type;
@@ -4420,6 +4421,39 @@ struct test_pad : public test_case {
         ggml_set_name(a, "a");
 
         ggml_tensor * out = ggml_pad(ctx, a, pad_0, pad_1, 0, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+struct test_pad_ext : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;
+    const int lp0;
+    const int rp0;
+    const int lp1;
+    const int rp1;
+    const int lp2;
+    const int rp2;
+    const int lp3;
+    const int rp3;
+
+    std::string vars() override {
+        return VARS_TO_STR10(type, ne_a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+    }
+
+    test_pad_ext(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne_a = {512, 512, 3, 1},
+            int lp0 = 1, int rp0 = 1, int lp1 = 1, int rp1 = 1,
+            int lp2 = 1, int rp2 = 1, int lp3 = 1, int rp3 = 1)
+        : type(type), ne_a(ne_a), lp0(lp0), rp0(rp0), lp1(lp1), rp1(rp1), lp2(lp2), rp2(rp2), lp3(lp3), rp3(rp3)  {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_pad_ext(ctx, a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
         ggml_set_name(out, "out");
 
         return out;
@@ -5499,6 +5533,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9}, 1, 0, 1, true));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, 2, 1, 1, false));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, 2, 1, 1, true));
+    test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 2}, {3, 3, 1, 9}, 1, 0, 1, false));
+    test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 2}, {3, 3, 1, 9}, 1, 0, 1, true));
+    test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 2}, {3, 3, 1, 64}, 2, 1, 1, false));
+    test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 2}, {3, 3, 1, 64}, 2, 1, 1, true));
 
     for(uint32_t Cout : {1, 9}){
         for(uint32_t Cin : {1, 7}){
@@ -6055,9 +6093,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {9, 9, 1280, 1}));
     test_cases.emplace_back(new test_acc());
     test_cases.emplace_back(new test_pad());
+    test_cases.emplace_back(new test_pad_ext());
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F16, {256, 256, 1, 2}, 2, 2, 3, 3, 2, 2, 1, 3));
     test_cases.emplace_back(new test_pad_reflect_1d());
     test_cases.emplace_back(new test_roll());
-    test_cases.emplace_back(new test_arange());
+    test_cases.emplace_back(new test_arange()); 
+
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_leaky_relu());
 
