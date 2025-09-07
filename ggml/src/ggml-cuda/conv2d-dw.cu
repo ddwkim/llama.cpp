@@ -234,6 +234,142 @@ __global__ void conv2d_dw_kernel_tiled(
     }
 }
 
+// ===== COMPILE-TIME TEMPLATE KERNEL =====
+template<int KW, int KH, int TX, int TY, typename T, typename Layout>
+__global__ void conv2d_dw_kernel_tiled_ct(
+    const T* __restrict__ input,
+    const T* __restrict__ kernel,
+    T* __restrict__ output,
+    int in_w, int in_h,
+    int out_w, int out_h,
+    int stride_x, int stride_y,
+    int padding_x, int padding_y,
+    int dilation_x, int dilation_y,
+    int channels, int batches)
+{
+    const int cz = blockIdx.z;
+    const int c  = cz % channels;
+    const int n  = cz / channels;
+    if (n >= batches) return;
+
+    const int ox0 = blockIdx.x * TX;
+    const int oy0 = blockIdx.y * TY;
+
+    const int in_x0 = ox0 * stride_x - padding_x;
+    const int in_y0 = oy0 * stride_y - padding_y;
+
+    const int tile_w = (TX - 1) * stride_x + (KW - 1) * dilation_x + 1;
+    const int tile_h = (TY - 1) * stride_y + (KH - 1) * dilation_y + 1;
+
+    extern __shared__ T smem[]; // tile_w * tile_h + KW * KH
+    T* tile = smem;
+    T* kernel_tile = smem + tile_w * tile_h;
+
+    conv_params params = {
+        in_w, in_h, out_w, out_h, KW, KH,
+        stride_x, stride_y, padding_x, padding_y,
+        dilation_x, dilation_y, channels, batches
+    };
+
+    // Load input tile to shared memory
+    for (int dy = threadIdx.y; dy < tile_h; dy += blockDim.y) {
+        const int gy = in_y0 + dy;
+        const bool y_ok = (unsigned)gy < (unsigned)in_h;
+
+        for (int dx = threadIdx.x; dx < tile_w; dx += blockDim.x) {
+            const int gx = in_x0 + dx;
+            T v = 0;
+            if (y_ok && (unsigned)gx < (unsigned)in_w) {
+                v = input[Layout::input_index(n, c, gy, gx, params)];
+            }
+            tile[dy * tile_w + dx] = v;
+        }
+    }
+    
+    // Load kernel to shared memory
+    for (int ky = threadIdx.y; ky < KH; ky += blockDim.y) {
+        for (int kx = threadIdx.x; kx < KW; kx += blockDim.x) {
+            kernel_tile[ky * KW + kx] = kernel[Layout::kernel_index(c, ky, kx, params)];
+        }
+    }
+    __syncthreads();
+
+    const int ox = ox0 + threadIdx.x;
+    const int oy = oy0 + threadIdx.y;
+
+    if (ox < out_w && oy < out_h) {
+        T acc = 0;
+
+        const int sx0 = threadIdx.x * stride_x;
+        const int sy0 = threadIdx.y * stride_y;
+
+        #pragma unroll
+        for (int ky = 0; ky < KH; ++ky) {
+            const int sy = sy0 + ky * dilation_y;
+            #pragma unroll
+            for (int kx = 0; kx < KW; ++kx) {
+                const int sx = sy * tile_w + (sx0 + kx * dilation_x);
+                const T a = tile[sx];
+                const T w = kernel_tile[ky * KW + kx];
+                acc = fmaf(a, w, acc);
+            }
+        }
+
+        output[Layout::output_index(n, c, oy, ox, params)] = acc;
+    }
+}
+
+// ===== COMPILE-TIME LAUNCHER =====
+template<int TX, int TY>
+void launch_tiled_stride1_ct(
+    int K,
+    const float* __restrict__ input,
+    const float* __restrict__ kernel,
+    float* __restrict__ output,
+    int in_w, int in_h,
+    int out_w, int out_h,
+    int stride_x, int stride_y,
+    int padding_x, int padding_y,
+    int dilation_x, int dilation_y,
+    int channels, int batches,
+    dim3 grid, dim3 block, size_t smem, cudaStream_t stream)
+{
+    switch (K) {
+        case 3: 
+            conv2d_dw_kernel_tiled_ct<3,3,TX,TY,float,whcn_layout><<<grid, block, smem, stream>>>(
+                input, kernel, output,
+                in_w, in_h, out_w, out_h,
+                stride_x, stride_y,
+                padding_x, padding_y,
+                dilation_x, dilation_y,
+                channels, batches
+            );
+            break;
+        case 5: 
+            conv2d_dw_kernel_tiled_ct<5,5,TX,TY,float,whcn_layout><<<grid, block, smem, stream>>>(
+                input, kernel, output,
+                in_w, in_h, out_w, out_h,
+                stride_x, stride_y,
+                padding_x, padding_y,
+                dilation_x, dilation_y,
+                channels, batches
+            );
+            break;
+        default: 
+            // Fallback to general tiled version for other kernel sizes
+            conv2d_dw_kernel_tiled<float,whcn_layout,TX,TY><<<grid, block, smem, stream>>>(
+                input, kernel, output,
+                in_w, in_h, out_w, out_h,
+                K, K,  // kernel_w, kernel_h
+                stride_x, stride_y,
+                padding_x, padding_y,
+                dilation_x, dilation_y,
+                channels, batches
+            );
+            break;
+    }
+}
+
 
 void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
@@ -264,7 +400,7 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     cudaStream_t st = ctx.stream();
 
     // Choose kernel based on stride
-    if (stride_x == 1 && stride_y == 1) {
+    if (stride_x == 1 && stride_y == 1 && kernel_w <= 7 && kernel_h <= 7) {
         // Use tiled kernel for stride = 1 (better performance)
         const int TILE_X = 32;
         const int TILE_Y = 8;
@@ -285,11 +421,28 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                             batches * channels);
             dim3 threads_2d(TILE_X, TILE_Y);
             
+            // Choose between compile-time template and regular tiled kernel
+            bool use_compile_time = (kernel_w == kernel_h && (kernel_w == 3 || kernel_w == 5));
+            
             if (ggml_is_contiguous(input)) {
-                conv2d_dw_kernel_tiled<float, whcn_layout, TILE_X, TILE_Y><<<blocks_2d, threads_2d, shared_mem_size, st>>>(
-                    x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
-                    dilation_x, dilation_y, channels, batches);
+                if (use_compile_time) {
+                    launch_tiled_stride1_ct<TILE_X, TILE_Y>(
+                        kernel_w,
+                        x_d, w_d, y_d,
+                        in_w, in_h, out_w, out_h,
+                        stride_x, stride_y,
+                        padding_x, padding_y,
+                        dilation_x, dilation_y,
+                        channels, batches,
+                        blocks_2d, threads_2d, shared_mem_size, st
+                    );
+                } else {
+                    conv2d_dw_kernel_tiled<float, whcn_layout, TILE_X, TILE_Y><<<blocks_2d, threads_2d, shared_mem_size, st>>>(
+                        x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
+                        dilation_x, dilation_y, channels, batches);
+                }
             } else if (ggml_is_contiguous_channels(input)) {
+                // For cwhn_layout, we don't have compile-time template support yet, so use regular tiled
                 conv2d_dw_kernel_tiled<float, cwhn_layout, TILE_X, TILE_Y><<<blocks_2d, threads_2d, shared_mem_size, st>>>(
                     x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
                     dilation_x, dilation_y, channels, batches);
