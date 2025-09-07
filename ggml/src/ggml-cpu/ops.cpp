@@ -7857,21 +7857,23 @@ void ggml_compute_forward_upscale(
 
 // ggml_compute_forward_pad
 
-static void ggml_compute_forward_pad_f32(
+static void ggml_compute_forward_pad_impl(
     const ggml_compute_params * params,
           ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
 
-    GGML_ASSERT(src0->nb[0] == sizeof(float));
-    GGML_ASSERT( dst->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->type == dst->type);
 
     const int ith = params->ith;
     const int nth = params->nth;
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
-    float * dst_ptr = (float *) dst->data;
+    const size_t ts = ggml_type_size(dst->type);
+    const char * src_base = (const char *) src0->data;
+    char *       dst_base = (char *) dst->data;
+
     const int32_t lp0 = ggml_get_op_params_i32(dst, 0);
     const int32_t rp0 = ggml_get_op_params_i32(dst, 1);
     const int32_t lp1 = ggml_get_op_params_i32(dst, 2);
@@ -7888,16 +7890,26 @@ static void ggml_compute_forward_pad_f32(
         for (int64_t i1 = ith; i1 < ne1; i1 += nth) {
             for (int64_t i0 = 0; i0 < ne0; ++i0) {
                 for (int64_t i3 = 0; i3 < ne3; ++i3) {
-                    const int64_t dst_idx = i3*(ne0*ne1*ne2) + i2*(ne0*ne1) + i1*ne0 + i0;
-                    if ((i0 >= lp0 && i0 < ne0 - rp0) \
-                         && (i1 >= lp1 && i1 < ne1 - rp1) \
-                         && (i2 >= lp2 && i2 < ne2 - rp2) \
-                         && (i3 >= lp3 && i3 < ne3 - rp3)) {
-                        const int64_t src_idx = (i3 - lp3)*nb03 + (i2 - lp2)*nb02 + (i1 - lp1)*nb01 + (i0 - lp0)*nb00;
-                        const float * src_ptr = (const float *)((char *) src0->data + src_idx);
-                        dst_ptr[dst_idx] = *src_ptr;
+                    const size_t dst_off =
+                        (size_t)i3*nb3 + (size_t)i2*nb2 + (size_t)i1*nb1 + (size_t)i0*nb0;
+
+                    const bool in_x = (i0 >= lp0 && i0 < ne0 - rp0);
+                    const bool in_y = (i1 >= lp1 && i1 < ne1 - rp1);
+                    const bool in_z = (i2 >= lp2 && i2 < ne2 - rp2);
+                    const bool in_w = (i3 >= lp3 && i3 < ne3 - rp3);
+
+                    if (in_x && in_y && in_z && in_w) {
+                        const int64_t s0 = i0 - lp0;
+                        const int64_t s1 = i1 - lp1;
+                        const int64_t s2 = i2 - lp2;
+                        const int64_t s3 = i3 - lp3;
+
+                        const size_t src_off =
+                            (size_t)s3*nb03 + (size_t)s2*nb02 + (size_t)s1*nb01 + (size_t)s0*nb00;
+
+                        memcpy(dst_base + dst_off, src_base + src_off, ts);
                     } else {
-                        dst_ptr[dst_idx] = 0;
+                        memset(dst_base + dst_off, 0, ts);
                     }
                 }
             }
@@ -7913,8 +7925,10 @@ void ggml_compute_forward_pad(
 
     switch (src0->type) {
         case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
             {
-                ggml_compute_forward_pad_f32(params, dst);
+                ggml_compute_forward_pad_impl(params, dst);
             } break;
         default:
             {

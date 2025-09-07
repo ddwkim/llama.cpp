@@ -6093,8 +6093,54 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {9, 9, 1280, 1}));
     test_cases.emplace_back(new test_acc());
     test_cases.emplace_back(new test_pad());
-    test_cases.emplace_back(new test_pad_ext());
+    // test_cases.emplace_back(new ?
+    // ());
+    
+    // Small test cases
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {32, 32, 1, 1}, 1, 1, 1, 1, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 64, 1, 1}, 2, 2, 2, 2, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {128, 128, 1, 1}, 3, 3, 3, 3, 1, 1, 1, 1));
+    
+    // Medium test cases
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {256, 256, 1, 1}, 4, 4, 4, 4, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {512, 512, 1, 1}, 5, 5, 5, 5, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {1024, 1024, 1, 1}, 6, 6, 6, 6, 1, 1, 1, 1));
+    
+    // Different data types
     test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F16, {256, 256, 1, 2}, 2, 2, 3, 3, 2, 2, 1, 3));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_BF16, {256, 128, 4, 3}, 4, 2, 3, 1, 2, 2, 1, 3));
+    
+    // Asymmetric padding
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {256, 256, 1, 1}, 1, 3, 2, 4, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {512, 256, 1, 1}, 2, 1, 3, 2, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {128, 512, 1, 1}, 3, 2, 1, 3, 1, 1, 1, 1));
+    
+    // Different channel dimensions
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {256, 256, 3, 1}, 2, 2, 2, 2, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {256, 256, 1, 3}, 2, 2, 2, 2, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {128, 128, 4, 2}, 1, 1, 1, 1, 1, 1, 1, 1));
+    
+    // Large test cases
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2048, 2048, 1, 1}, 8, 8, 8, 8, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {4096, 4096, 1, 1}, 10, 10, 10, 10, 1, 1, 1, 1));
+    
+    // Edge cases - minimal padding
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 64, 1, 1}, 0, 0, 0, 0, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {128, 128, 1, 1}, 1, 0, 0, 1, 1, 1, 1, 1));
+    
+    // Edge cases - large padding
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 64, 1, 1}, 16, 16, 16, 16, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {128, 128, 1, 1}, 32, 32, 32, 32, 1, 1, 1, 1));
+    
+    // Different stride and dilation combinations
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {256, 256, 1, 1}, 2, 2, 2, 2, 2, 2, 2, 2));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {512, 512, 1, 1}, 3, 3, 3, 3, 3, 3, 3, 3));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {128, 128, 1, 1}, 1, 1, 1, 1, 4, 4, 4, 4));
+    
+    // Mixed data types with different sizes
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F16, {512, 512, 1, 1}, 4, 4, 4, 4, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_BF16, {1024, 1024, 1, 1}, 6, 6, 6, 6, 1, 1, 1, 1));
+
     test_cases.emplace_back(new test_pad_reflect_1d());
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_arange()); 
