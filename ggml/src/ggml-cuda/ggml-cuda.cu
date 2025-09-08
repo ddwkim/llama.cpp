@@ -3476,7 +3476,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return false;
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK: {
-            return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
+            return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type);
         }
         case GGML_OP_IM2COL:
         case GGML_OP_CONV_2D_DW:
